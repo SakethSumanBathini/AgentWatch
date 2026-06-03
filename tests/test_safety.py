@@ -592,3 +592,40 @@ def test_rm_score_event_catches_bypass_variants():
     ]:
         score = score_event(_tool_event("bash", command))
         assert score.total >= 90, f"{command!r} should score >= 90, got {score.total}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -r -- --force /etc",
+        "rm -f -- --recursive /",
+        "rm -- -rf /",
+    ],
+)
+def test_rm_double_dash_terminates_option_parsing(command):
+    """After ``--`` every token is an operand, not a flag, so ``--force`` /
+    ``--recursive`` appearing there must NOT be read as flags (Issue #123 review)."""
+    scorer = RiskScorer()
+    level, _, _, _ = scorer.score(
+        ToolCallData(tool_name="bash", raw_command=command, arguments={})
+    )
+    assert level != RiskLevel.CRITICAL, f"{command!r} must not be CRITICAL: -- ends option parsing"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf -- /",
+        "rm -r -f -- /etc",
+        "rm --recursive --force -- /home",
+    ],
+)
+def test_rm_double_dash_still_catches_real_targets(command):
+    """``--`` separates flags from the path but the delete is still recursive +
+    forced against a critical target, so it must stay CRITICAL."""
+    scorer = RiskScorer()
+    level, _, _, policies = scorer.score(
+        ToolCallData(tool_name="bash", raw_command=command, arguments={})
+    )
+    assert level == RiskLevel.CRITICAL, f"{command!r} should be CRITICAL"
+    assert "FS_DELETE_CRITICAL" in policies

@@ -248,21 +248,33 @@ def rm_targets_critical_path(text: str) -> bool:
     has_recursive = False
     has_force = False
     has_critical_path = False
+    end_of_options = False
 
     for arg in parts[start + 1 :]:
-        if arg == "--recursive":
-            has_recursive = True
-        elif arg == "--force":
-            has_force = True
-        elif arg in ("--no-preserve-root", "--"):
-            continue
-        elif re.fullmatch(r"-[A-Za-z]+", arg):
-            flags = arg[1:]
-            if "r" in flags or "R" in flags:
+        # ``--`` terminates option parsing: every token after it is an operand
+        # (a path), never a flag -- so ``rm -r -- --force /`` does NOT count as
+        # forced. The path matcher below still runs so ``rm -rf -- /`` is caught.
+        if not end_of_options:
+            if arg == "--":
+                end_of_options = True
+                continue
+            if arg == "--recursive":
                 has_recursive = True
-            if "f" in flags:
+                continue
+            if arg == "--force":
                 has_force = True
-        elif _RM_CRITICAL_PATH_RE.match(arg):
+                continue
+            if arg == "--no-preserve-root":
+                continue
+            if re.fullmatch(r"-[A-Za-z]+", arg):
+                flags = arg[1:]
+                if "r" in flags or "R" in flags:
+                    has_recursive = True
+                if "f" in flags:
+                    has_force = True
+                continue
+
+        if _RM_CRITICAL_PATH_RE.match(arg):
             has_critical_path = True
 
     return has_recursive and has_force and has_critical_path
