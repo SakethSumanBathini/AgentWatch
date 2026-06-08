@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -18,11 +20,14 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agentwatch.alerting.engine import AlertingConfig, AlertingEngine
@@ -44,12 +49,83 @@ from agentwatch.cost.tracker import CostTracker
 from agentwatch.governance.compliance_reporter import ComplianceReporter
 from agentwatch.governance.engine import AuditEventType, GovernanceEngine
 from agentwatch.reasoning.auditor import ReasoningAuditor
+from agentwatch.replay.counterfactual import CounterfactualEngine, CounterfactualScenario
 from agentwatch.replay.engine import ReplayEngine
 from agentwatch.rollback.engine import RollbackEngine
 from agentwatch.scoring.confidence import ConfidenceScorer
 from agentwatch.tracing.collector import TraceCollector
 
 logger = logging.getLogger(__name__)
+
+RATE_READ = int(os.getenv("API_RATE_LIMIT_READ", "1000"))
+RATE_WRITE = int(os.getenv("API_RATE_LIMIT_WRITE", "200"))
+RATE_WINDOW_SEC = int(os.getenv("API_RATE_LIMIT_WINDOW_SEC", "60"))
+RATE_BUCKET_TTL_SEC = int(os.getenv("API_RATE_LIMIT_BUCKET_TTL_SEC", str(RATE_WINDOW_SEC + 30)))
+
+
+class _Limiter:
+    def __init__(self) -> None:
+        self._buckets: dict[str, dict[str, float | int]] = defaultdict(
+            lambda: {"count": 0, "start": 0.0}
+        )
+        self._checks_since_prune = 0
+
+    def reset(self) -> None:
+        self._buckets.clear()
+        self._checks_since_prune = 0
+
+    def _prune_stale(self, now: float) -> None:
+        cutoff = now - RATE_BUCKET_TTL_SEC
+        for key in [k for k, b in self._buckets.items() if b["start"] < cutoff]:
+            del self._buckets[key]
+
+    def check(self, ip: str, limit: int, request: Request) -> None:
+        now = time.time()
+        self._checks_since_prune += 1
+        if self._checks_since_prune >= 64 or len(self._buckets) > 4096:
+            self._prune_stale(now)
+            self._checks_since_prune = 0
+
+        b = self._buckets[ip]
+        if now - b["start"] > RATE_WINDOW_SEC:
+            b["count"] = 0
+            b["start"] = now
+        b["count"] += 1
+        remaining = max(0, limit - b["count"])
+        request.state.rl_limit = limit
+        request.state.rl_remaining = remaining
+        if b["count"] > limit:
+            raise HTTPException(
+                status_code=429,
+                detail="rate_limit_exceeded",
+                headers={
+                    "X-RateLimit-Limit": str(limit),
+                    "X-RateLimit-Remaining": "0",
+                    "Retry-After": str(RATE_WINDOW_SEC),
+                },
+            )
+
+
+_limiter = _Limiter()
+
+
+def reset_rate_limiter_for_tests() -> None:
+    """Clear in-memory counters between tests (test-only helper)."""
+    _limiter.reset()
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _rate_limit_key(request: Request, suffix: str) -> str:
+    return f"{_client_ip(request)}:{suffix}"
+
 
 _db_session_factory = None
 
@@ -234,6 +310,13 @@ class SafetyPolicyUpdate(BaseModel):
     approval_timeout_seconds: int = 120
 
 
+class SimulateRequest(BaseModel):
+    rewind_to_step: int
+    tool_id: str | None = None
+    replacement: Any = None
+    notes: str = ""
+
+
 class SafetyCheckRequest(BaseModel):
     command: str = Field(min_length=1)
     tool_name: str = "bash"
@@ -414,6 +497,32 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+
+@app.exception_handler(HTTPException)
+async def _agentwatch_http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code == 429 and exc.detail == "rate_limit_exceeded":
+        headers = dict(exc.headers) if exc.headers else {}
+        if hasattr(request.state, "rl_limit"):
+            headers.setdefault("X-RateLimit-Limit", str(request.state.rl_limit))
+            headers.setdefault("X-RateLimit-Remaining", str(request.state.rl_remaining))
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate_limit_exceeded"},
+            headers=headers,
+        )
+    return await http_exception_handler(request, exc)
+
+
+@app.middleware("http")
+async def rl_headers(request: Request, call_next):
+    """Add X-RateLimit-* headers to every response including 429s."""
+    response = await call_next(request)
+    if hasattr(request.state, "rl_limit"):
+        response.headers["X-RateLimit-Limit"] = str(request.state.rl_limit)
+        response.headers["X-RateLimit-Remaining"] = str(request.state.rl_remaining)
+    return response
+
+
 # CORS configuration.
 #
 # allow_credentials=True requires an explicit origin list -- the CORS spec
@@ -459,7 +568,8 @@ async def system_status(_auth: None = Depends(_require_api_key)) -> dict[str, An
 
 
 @app.get("/health")
-async def health() -> dict[str, Any]:
+async def health(request: Request) -> dict[str, Any]:
+    _limiter.check(_rate_limit_key(request, "r"), RATE_READ, request)
     return {
         "status": "ok",
         "version": "0.2.0",
@@ -474,12 +584,14 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/v1/sessions", response_model=SessionListResponse)
 async def list_sessions(
+    request: Request,
     limit: int = Query(default=50, le=200),
     framework: str | None = Query(default=None),
     status: str | None = Query(default=None),
     since_hours: int | None = Query(default=None),
     _auth: None = Depends(_require_api_key),
 ) -> SessionListResponse:
+    _limiter.check(_rate_limit_key(request, "r"), RATE_READ, request)
     since = None
     if since_hours is not None:
         since = datetime.now(UTC) - timedelta(hours=since_hours)
@@ -493,15 +605,23 @@ async def list_sessions(
 
 @app.post("/api/v1/sessions")
 async def create_session(
-    session: AgentSession, _auth: None = Depends(_require_api_key)
+    request: Request,
+    session: AgentSession,
+    _auth: None = Depends(_require_api_key),
 ) -> dict[str, Any]:
+    _limiter.check(_rate_limit_key(request, "w"), RATE_WRITE, request)
     _collector.register_session(session)
     await _pg_write_session(session)
     return {"status": "registered", "session": session.model_dump(mode="json")}
 
 
 @app.get("/api/v1/sessions/{session_id}")
-async def get_session(session_id: str, _auth: None = Depends(_require_api_key)) -> dict[str, Any]:
+async def get_session(
+    request: Request,
+    session_id: str,
+    _auth: None = Depends(_require_api_key),
+) -> dict[str, Any]:
+    _limiter.check(_rate_limit_key(request, "r"), RATE_READ, request)
     trace = _collector.get_trace(session_id)
     if not trace:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
@@ -510,11 +630,13 @@ async def get_session(session_id: str, _auth: None = Depends(_require_api_key)) 
 
 @app.get("/api/v1/sessions/{session_id}/events", response_model=TraceResponse)
 async def get_events(
+    request: Request,
     session_id: str,
     event_type: str | None = Query(default=None),
     limit: int = Query(default=500, le=2000),
     _auth: None = Depends(_require_api_key),
 ) -> TraceResponse:
+    _limiter.check(_rate_limit_key(request, "r"), RATE_READ, request)
     events = _collector.get_events(session_id, event_type=event_type, limit=limit)
     return TraceResponse(
         session_id=session_id,
@@ -525,8 +647,11 @@ async def get_events(
 
 @app.post("/api/v1/events")
 async def ingest_event(
-    event: AgentEvent, _auth: None = Depends(_require_api_key)
+    request: Request,
+    event: AgentEvent,
+    _auth: None = Depends(_require_api_key),
 ) -> dict[str, Any]:
+    _limiter.check(_rate_limit_key(request, "w"), RATE_WRITE, request)
     await get_event_bus().publish(event)
     return {"status": "accepted", "event_id": event.event_id}
 
@@ -590,7 +715,57 @@ async def get_replay(session_id: str, _auth: None = Depends(_require_api_key)) -
     trace = _collector.get_trace(session_id)
     if not events or not trace:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-    return _replay_engine.load_from_events(trace.session, events).to_dict()
+
+    replay = _replay_engine.load_from_events(trace.session, events)
+    audit_summary = await _reasoning_auditor.audit_session(events)
+
+    d = replay.to_dict()
+    d["reasoning_audit"] = {
+        "overall_score": audit_summary.average_score,
+        "hallucination_risk": 1.0 - audit_summary.average_score,  # Simple heuristic for UI
+        "goal_alignment": audit_summary.average_score,  # Shared heuristic
+        "findings": [
+            {
+                "type": a.verdict,
+                "severity": "high" if a.score < 0.4 else "medium" if a.score < 0.7 else "low",
+                "message": a.rationale,
+                "step_index": a.step_index,
+            }
+            for a in audit_summary.audits
+            if a.score < 0.7
+        ],
+    }
+    return d
+
+
+@app.post("/api/v1/sessions/{session_id}/simulate")
+async def simulate_session(
+    session_id: str, request: SimulateRequest, _auth: None = Depends(_require_api_key)
+) -> dict[str, Any]:
+    events = _collector.get_events(session_id, limit=5000)
+    trace = _collector.get_trace(session_id)
+    if not events or not trace:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    scenario = CounterfactualScenario(
+        rewind_to_step=request.rewind_to_step,
+        tool_id=request.tool_id,
+        replacement=request.replacement,
+        notes=request.notes,
+    )
+    try:
+        engine = CounterfactualEngine()
+        result = engine.run(events, scenario)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "session_id": session_id,
+        "diverged_at_step": result.diverged_at_step,
+        "original_events": [e.model_dump_for_storage() for e in result.original_events],
+        "alternate_events": [e.model_dump_for_storage() for e in result.alternate_events],
+        "summary": result.summary,
+    }
 
 
 @app.get("/api/v1/sessions/{session_id}/checkpoints")
