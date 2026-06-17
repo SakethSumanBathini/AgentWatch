@@ -227,9 +227,12 @@ def _detect_direction(question: str) -> TraversalDirection:
 
 
 def _detect_edge_filter(question: str) -> EdgeKind | None:
-    q = question.lower()
+    # Word-boundary match so a cue like "cause" does not fire inside "because".
+    # We match a cue when it appears as a whole word or as the stem of a word
+    # (e.g. "constraint"/"constraints", "produce"/"produced").
+    words = re.findall(r"[a-z]+", question.lower())
     for cue, kind in _EDGE_CUES.items():
-        if cue in q:
+        if any(w == cue or w.startswith(cue) for w in words):
             return kind
     return None
 
@@ -268,22 +271,30 @@ def _node_match_score(query: GraphQuery, node: CausalNode) -> float:
     # Semantic component (deterministic hashed embedding fallback is fine).
     semantic_score = cosine(embed(query.raw), embed(node.text))
 
-    # A decision node is the most natural entry point for a "why" question; a
-    # small nudge keeps decisions ahead of context nodes on ties.
-    kind_bonus = 0.05 if node.kind == "decision" else 0.0
-
-    return 0.6 * keyword_score + 0.4 * max(0.0, semantic_score) + kind_bonus
+    # NB: the decision-node preference is applied as a tie-breaker in
+    # _find_entry_node, NOT added here, so it can never inflate a node above
+    # the min_match threshold on its own (which would cause false positives).
+    return 0.6 * keyword_score + 0.4 * max(0.0, semantic_score)
 
 
 def _find_entry_node(query: GraphQuery, graph: CausalGraph) -> tuple[CausalNode | None, float]:
-    """Pick the graph node that best matches the question."""
+    """Pick the graph node that best matches the question.
+
+    Ties on the base score are broken in favour of ``decision`` nodes, which
+    are the most natural entry point for a "why" question. The tie-breaker
+    never changes the score itself, so it cannot push an otherwise-irrelevant
+    node above the ``min_match`` threshold.
+    """
     best: CausalNode | None = None
     best_score = 0.0
+    best_is_decision = False
     for node in graph.nodes.values():
         score = _node_match_score(query, node)
-        if score > best_score:
+        is_decision = node.kind == "decision"
+        if score > best_score or (score == best_score and is_decision and not best_is_decision):
             best_score = score
             best = node
+            best_is_decision = is_decision
     return best, best_score
 
 
@@ -334,21 +345,23 @@ def query(
     # graph.explain() includes the entry node itself as the first element;
     # graph.downstream() does not. Normalise both to "path excluding entry".
     steps: list[TraversalStep] = []
+    depth = 0
     for node in chain:
         if node.node_id == entry.node_id:
             continue
-        steps.append(TraversalStep(node=node, depth=1))
+        depth += 1
+        steps.append(TraversalStep(node=node, depth=depth))
 
     # Optional edge-kind filter: keep only nodes reachable by that edge kind
     # directly from the entry node. This is a light refinement on top of the
     # BFS chain so that "what constraints shaped X" returns constraint nodes.
     if parsed.edge_filter is not None:
         directly_related = _direct_neighbours(graph, entry.node_id, parsed)
-        filtered = [s for s in steps if s.node.node_id in directly_related]
-        # Only apply the filter when it leaves something; otherwise fall back
-        # to the full chain so a too-narrow filter never blanks a real answer.
-        if filtered:
-            steps = filtered
+        # Respect the explicit constraint: when the question names a specific
+        # edge kind, return only nodes reachable by that edge. If nothing
+        # matches, return an empty path rather than misleading unrelated
+        # nodes the user did not ask for.
+        steps = [s for s in steps if s.node.node_id in directly_related]
 
     return GraphQueryResult(
         question=question,

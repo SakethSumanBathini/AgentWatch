@@ -26,15 +26,9 @@ def _sample_graph() -> CausalGraph:
         kind="context",
         text="app needs ACID transactions and JSON support",
     )
-    constraint = CausalNode(
-        node_id="x1", kind="constraint", text="team already knows Postgres"
-    )
-    decision = CausalNode(
-        node_id="d1", kind="decision", text="choose Postgres over MySQL"
-    )
-    outcome = CausalNode(
-        node_id="o1", kind="outcome", text="migrations ran smoothly in production"
-    )
+    constraint = CausalNode(node_id="x1", kind="constraint", text="team already knows Postgres")
+    decision = CausalNode(node_id="d1", kind="decision", text="choose Postgres over MySQL")
+    outcome = CausalNode(node_id="o1", kind="outcome", text="migrations ran smoothly in production")
     for n in (ctx, constraint, decision, outcome):
         g.add_node(n)
     g.add_edge("c1", "d1", EdgeKind.CAUSED_BY)
@@ -76,13 +70,18 @@ def test_what_happened_question_traverses_downstream_to_outcome():
     g = _sample_graph()
     result = query("What happened as a result of choosing Postgres?", g)
     assert result.direction is TraversalDirection.DOWNSTREAM
+    assert result.answered
+    assert result.entry_node is not None
+    assert result.entry_node.node_id == "d1"
     assert any(step.node.node_id == "o1" for step in result.path)
 
 
 def test_edge_filter_narrows_to_constraint():
     g = _sample_graph()
     result = query("What constraints shaped the Postgres decision?", g)
-    assert any(step.node.node_id == "x1" for step in result.path)
+    # The constraint filter must narrow to exactly the constraint node — no
+    # other upstream nodes (e.g. the context node c1) may leak through.
+    assert {step.node.node_id for step in result.path} == {"x1"}
 
 
 def test_irrelevant_question_is_not_answered():
