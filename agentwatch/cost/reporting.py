@@ -18,10 +18,37 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import ValidationError
+
 from agentwatch.core.schema import AgentSession, ExecutionStatus
 
 #: Session dimensions the report can group by.
 VALID_GROUP_BY: tuple[str, ...] = ("framework", "agent", "status")
+
+
+def parse_sessions(items: list[dict[str, object]]) -> tuple[list[AgentSession], int]:
+    """Validate raw session dicts into :class:`AgentSession`, skipping bad rows.
+
+    The sessions API returns already-serialized sessions, but legacy or partial
+    records can still fail validation. Rather than crashing the whole report on a
+    single bad row, invalid records are skipped and counted so the caller can
+    surface how many were dropped.
+
+    Args:
+        items: Raw session dictionaries (e.g. from the sessions API response).
+
+    Returns:
+        A ``(sessions, skipped)`` tuple: the successfully parsed sessions and the
+        number of records that failed validation.
+    """
+    sessions: list[AgentSession] = []
+    skipped = 0
+    for item in items:
+        try:
+            sessions.append(AgentSession.model_validate(item))
+        except ValidationError:
+            skipped += 1
+    return sessions, skipped
 
 
 def _group_key(session: AgentSession, group_by: str) -> str:
@@ -29,9 +56,9 @@ def _group_key(session: AgentSession, group_by: str) -> str:
         return session.framework.value
     if group_by == "agent":
         return session.agent_name or session.agent_id
-    if group_by == "status":
-        return session.status.value
-    raise ValueError(f"unsupported group_by: {group_by!r} (expected one of {VALID_GROUP_BY})")
+    # "status" is the only remaining option; build_cost_report validates group_by
+    # against VALID_GROUP_BY before this helper is ever reached.
+    return session.status.value
 
 
 @dataclass

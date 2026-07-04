@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from agentwatch.core.schema import AgentFramework, AgentSession, ExecutionStatus
-from agentwatch.cost.reporting import build_cost_report
+from agentwatch.cost.reporting import build_cost_report, parse_sessions
 
 
 def _session(
@@ -140,3 +140,18 @@ def test_report_to_dict_shape() -> None:
     assert data["totals"] == {"sessions": 1, "total_tokens": 100, "total_usd": 2.0}
     assert data["rows"][0]["group"] == "crewai"
     assert data["rows"][0]["cost_per_successful_goal"] == 2.0
+
+
+def test_parse_sessions_keeps_valid_and_skips_malformed() -> None:
+    good = _session(tokens=10, usd=0.1).model_dump(mode="json")
+    items = [good, {}, {"foo": "bar"}]  # two rows missing the required agent_id
+    sessions, skipped = parse_sessions(items)
+    assert len(sessions) == 1
+    assert sessions[0].total_tokens == 10
+    assert skipped == 2
+
+
+def test_parse_sessions_empty() -> None:
+    sessions, skipped = parse_sessions([])
+    assert sessions == []
+    assert skipped == 0

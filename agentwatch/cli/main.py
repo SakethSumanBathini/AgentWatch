@@ -833,8 +833,7 @@ def cost_report(
     [b]Example Usage:[/b]
     [dim]python -m agentwatch.cli.main cost report --days 30 --group-by framework[/dim]
     """
-    from agentwatch.core.schema import AgentSession
-    from agentwatch.cost.reporting import VALID_GROUP_BY, build_cost_report
+    from agentwatch.cost.reporting import VALID_GROUP_BY, build_cost_report, parse_sessions
 
     if group_by not in VALID_GROUP_BY:
         console.print(
@@ -845,7 +844,9 @@ def cost_report(
         console.print("[red]--days must be >= 1.[/red]")
         raise typer.Exit(2)
 
-    async def _fetch() -> list[AgentSession]:
+    limit = 200  # /api/v1/sessions caps its page size at 200
+
+    async def _fetch() -> list[dict[str, object]]:
         try:
             import httpx
         except ImportError:
@@ -856,7 +857,7 @@ def cost_report(
             try:
                 resp = await client.get(
                     f"{api_url}/api/v1/sessions",
-                    params={"since_hours": days * 24, "limit": 200},
+                    params={"since_hours": days * 24, "limit": limit},
                     headers=_api_headers(api_key),
                     timeout=15.0,
                 )
@@ -868,9 +869,18 @@ def cost_report(
                 raise typer.Exit(1)
 
         payload = resp.json()
-        return [AgentSession.model_validate(item) for item in payload.get("sessions", [])]
+        items = payload.get("sessions", [])
+        return list(items) if isinstance(items, list) else []
 
-    sessions = asyncio.run(_fetch())
+    raw_sessions = asyncio.run(_fetch())
+    if len(raw_sessions) >= limit:
+        console.print(
+            f"[yellow]Note: the API returned its maximum of {limit} sessions, so this "
+            f"report may be incomplete. Narrow the window with a smaller --days.[/yellow]"
+        )
+    sessions, skipped = parse_sessions(raw_sessions)
+    if skipped:
+        console.print(f"[yellow]Skipped {skipped} session record(s) that failed to parse.[/yellow]")
     report = build_cost_report(sessions, group_by=group_by, days=days)
 
     if as_json:
