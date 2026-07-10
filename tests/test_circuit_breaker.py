@@ -134,7 +134,9 @@ class TestTripping:
         assert cb.history[-1].reason == TripReason.TOKEN_BUDGET.value
 
     def test_trips_on_consecutive_errors(self):
-        cb = CircuitBreaker("sess-1", CircuitThresholds(max_consecutive_errors=3, max_total_errors=0))
+        cb = CircuitBreaker(
+            "sess-1", CircuitThresholds(max_consecutive_errors=3, max_total_errors=0)
+        )
         cb.observe(error_event())
         cb.observe(error_event())
         assert cb.state is CircuitState.CLOSED
@@ -143,7 +145,9 @@ class TestTripping:
         assert cb.history[-1].reason == TripReason.CONSECUTIVE_ERRORS.value
 
     def test_consecutive_error_run_reset_by_success(self):
-        cb = CircuitBreaker("sess-1", CircuitThresholds(max_consecutive_errors=3, max_total_errors=0))
+        cb = CircuitBreaker(
+            "sess-1", CircuitThresholds(max_consecutive_errors=3, max_total_errors=0)
+        )
         cb.observe(error_event())
         cb.observe(error_event())
         cb.observe(success_event())  # resets the consecutive run
@@ -333,6 +337,27 @@ class TestHalfOpenRecovery:
         assert cb.state is CircuitState.CLOSED
         assert cb.status()["counters"]["total_errors"] == 0
         assert cb.status()["counters"]["total_tokens"] == 0
+
+    async def test_closed_transition_record_preserves_pre_reset_counters(self):
+        # The audit record for a CLOSED transition must reflect the counters at
+        # the moment of transition, not the post-reset zeros. This guards the
+        # EU AI Act Article 12 trail: a recovery record should still show the
+        # error count that triggered the original trip.
+        cb = CircuitBreaker(
+            "sess-1",
+            CircuitThresholds(max_total_errors=3, half_open_probe_successes=1),
+        )
+        cb.observe(error_event())
+        cb.observe(error_event())
+        cb.observe(error_event())  # trips OPEN with 3 total errors
+        await cb.resume()
+        cb.observe(success_event())  # HALF_OPEN -> CLOSED
+        assert cb.state is CircuitState.CLOSED
+        closed_record = cb.history[-1]
+        assert closed_record.to_state is CircuitState.CLOSED
+        assert closed_record.metadata["total_errors"] == 3  # not 0
+        # Live counters are still reset for the next window.
+        assert cb.status()["counters"]["total_errors"] == 0
 
 
 # --------------------------------------------------------------------------- manual controls

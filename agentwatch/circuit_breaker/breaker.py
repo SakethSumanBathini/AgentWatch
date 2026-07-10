@@ -173,6 +173,7 @@ class CircuitBreaker:
             return self._state
 
         self._events_observed += 1
+        self._last_step_number = event.step_number
         self._accumulate(event)
 
         if self._state is CircuitState.CLOSED:
@@ -338,9 +339,16 @@ class CircuitBreaker:
     ) -> None:
         from_state = self._state
         if to_state not in _ALLOWED[from_state]:
-            raise RuntimeError(
-                f"illegal circuit transition {from_state.value} -> {to_state.value}"
-            )
+            raise RuntimeError(f"illegal circuit transition {from_state.value} -> {to_state.value}")
+
+        # Snapshot the counters *before* a CLOSED transition resets the window, so
+        # the audit record reflects the state at the moment of transition (e.g. a
+        # recovery record shows the error count that triggered the trip, not 0).
+        transition_metadata = {
+            "total_tokens": self._total_tokens,
+            "total_errors": self._total_errors,
+            "hallucinations": self._hallucinations,
+        }
 
         self._state = to_state
         if to_state is CircuitState.CLOSED:
@@ -353,11 +361,7 @@ class CircuitBreaker:
             reason=reason,
             session_id=self.session_id,
             checkpoint_id=checkpoint_id,
-            metadata={
-                "total_tokens": self._total_tokens,
-                "total_errors": self._total_errors,
-                "hallucinations": self._hallucinations,
-            },
+            metadata=transition_metadata,
         )
         self._history.append(record)
         self._record_for_eu_ai_act(record)
