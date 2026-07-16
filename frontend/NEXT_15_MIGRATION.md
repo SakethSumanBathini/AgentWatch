@@ -31,7 +31,7 @@ which remain valid in 15. The API proxy at `pages/api/v1/[...path].ts` uses the 
 Run on Linux (the same environment as CI):
 
 - **`npm run type-check` (`tsc --noEmit`)** — passes.
-- **`npm run build`** — passes; all 16 pages compile and prerender as static content.
+- **`npm run build`** — passes; all 16 routes (14 pages + 2 API routes) compile, and the pages prerender as static content.
 - **Runtime.** Started the production server (`next start`) and exercised the routes; every one returns
   HTTP 200 and renders real content, with no server errors:
 
@@ -49,10 +49,12 @@ Run on Linux (the same environment as CI):
 
 ## Follow-up left out of scope: the ESLint migration
 
-`next lint` is removed in Next 15, and the `lint` script now launches an interactive codemod. Adding an
-`.eslintrc.json` to fix that makes `next build` start running ESLint, which then surfaces **7
-pre-existing errors** in `pages/replay.tsx` (unescaped `'` and `"`). Those errors predate this upgrade —
-the build has simply never linted, because no ESLint config was committed for it to find.
+`next lint` is **deprecated** in Next 15.5 (it now prints a deprecation warning and is scheduled for
+removal in Next 16); the recommended path is the standard ESLint CLI, and Next ships a
+`next-lint-to-eslint-cli` codemod to migrate. Wiring that up here — adding an `.eslintrc.json` so the
+project lints — makes `next build` start running ESLint, which then surfaces **7 pre-existing errors**
+in `pages/replay.tsx` (unescaped `'` and `"`). Those errors predate this upgrade — the build has simply
+never linted, because no ESLint config was committed for it to find.
 
 Fixing that properly means its own PR: an ESLint config plus fixing those 7 errors. Pulling it into this
 security upgrade would block a CVE fix behind unrelated lint churn. CI does not run lint
