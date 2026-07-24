@@ -104,6 +104,22 @@ def test_a_sibling_of_the_root_escapes_it():
     assert _fs().simulate(_write("/srv/other/file.txt")).escapes_root is True
 
 
+def test_a_posix_absolute_target_is_not_folded_under_the_root():
+    """Regression test: caught by a real Windows CI run, not written speculatively.
+
+    `_normalise` decided whether a path was absolute with `Path.is_absolute()`. That is correct
+    on POSIX, but on Windows `PureWindowsPath("/etc/passwd").is_absolute()` is False — there is no
+    drive letter — so `root / path` joined it as if it were relative, and `/etc/passwd` silently
+    became a path underneath the workspace root. Both `is_critical_path` and `escapes_root` came
+    back wrong as a result. This asserts the string form of the target so the test does not
+    itself depend on which platform's `Path` class is running.
+    """
+    result = _fs().simulate(_delete("/etc/passwd"))
+    assert str(result.target_path).replace("\\", "/") == "/etc/passwd"
+    assert result.is_critical_path is True
+    assert result.escapes_root is True
+
+
 # --------------------------------------------------------------------- critical paths
 
 
@@ -210,7 +226,11 @@ def test_no_filesystem_call_is_made_during_simulation(monkeypatch):
         FileAction(operation=FileOperation.MKDIR, path=Path("build/out")),
     ):
         result = fs.simulate(action)
-        assert result.target_path.is_absolute()
+        # `Path.is_absolute()` is platform-dependent for a POSIX-style path with no drive
+        # letter: PureWindowsPath("/etc/passwd").is_absolute() is False. This simulator's
+        # targets are POSIX paths regardless of what OS the test happens to run on, so check
+        # the string form instead of relying on the platform `Path` class's notion of absolute.
+        assert str(result.target_path).replace("\\", "/").startswith("/")
 
     fs.apply(_write("another.txt"))
     fs.exists(Path("another.txt"))

@@ -162,8 +162,18 @@ class ShadowFilesystem:
         this class must never perform I/O. `os.path.normpath` collapses the same segments purely
         textually, which is what a simulation wants anyway — the answer should not depend on what
         happens to be on the machine running it.
+
+        Absoluteness is checked with a leading-slash test rather than :meth:`Path.is_absolute`.
+        The paths this simulator reasons about — critical directories like ``/etc``, workspace
+        roots, targets from an agent's action — are POSIX paths regardless of the OS the lattice
+        happens to run on. `PureWindowsPath("/etc/passwd").is_absolute()` is ``False`` (there is no
+        drive letter), which would make `root / path` join it as if it were relative and silently
+        fold a real absolute path into a path underneath the workspace root — exactly the kind of
+        mistake that would make `_is_critical` and `_escapes_root` wrong on Windows.
         """
-        candidate = path if path.is_absolute() else root / path
+        text = str(path)
+        is_absolute = text.startswith(("/", "\\")) or path.is_absolute()
+        candidate = path if is_absolute else root / path
         return Path(os.path.normpath(str(candidate)))
 
     @staticmethod
