@@ -112,7 +112,12 @@ class ShadowFilesystem:
     known_paths: set[Path] = field(default_factory=set)
 
     def __init__(self, root: Path, known_paths: Iterable[Path] | None = None) -> None:
-        self.root = self._normalise(Path(root), root=Path(root))
+        root = Path(root)
+        if not self._is_posix_absolute(root):
+            raise ValueError(f"ShadowFilesystem root must be an absolute path, got {root!r}")
+        # root is now known absolute, so this call cannot take the relative branch of
+        # _normalise and cannot double up on itself — it only collapses `.`/`..` segments.
+        self.root = self._normalise(root, root=root)
         self.known_paths = {self._normalise(Path(p), root=self.root) for p in (known_paths or ())}
 
     # ------------------------------------------------------------------ public API
@@ -155,25 +160,31 @@ class ShadowFilesystem:
     # ------------------------------------------------------------------ internals
 
     @staticmethod
+    def _is_posix_absolute(path: Path) -> bool:
+        """Whether `path` is absolute, using POSIX semantics regardless of platform.
+
+        `Path.is_absolute()` alone is wrong here: the paths this simulator reasons about —
+        critical directories like ``/etc``, workspace roots, targets from an agent's action —
+        are POSIX paths regardless of the OS the lattice happens to run on, but
+        `PureWindowsPath("/etc/passwd").is_absolute()` is ``False`` (there is no drive letter).
+        Trusting that alone would make `root / path` join a real absolute path as if it were
+        relative — silently folding it underneath the workspace root, and making
+        `_is_critical` and `_escapes_root` wrong on Windows. A leading-slash string test is
+        checked first and is enough on its own to cover the POSIX case correctly everywhere.
+        """
+        return str(path).startswith(("/", "\\")) or path.is_absolute()
+
+    @staticmethod
     def _normalise(path: Path, *, root: Path) -> Path:
         """Make `path` absolute and collapse `.` and `..`, without touching the filesystem.
 
         `Path.resolve()` is not used on purpose: it stats the filesystem to follow symlinks, and
         this class must never perform I/O. `os.path.normpath` collapses the same segments purely
         textually, which is what a simulation wants anyway — the answer should not depend on what
-        happens to be on the machine running it.
-
-        Absoluteness is checked with a leading-slash test rather than :meth:`Path.is_absolute`.
-        The paths this simulator reasons about — critical directories like ``/etc``, workspace
-        roots, targets from an agent's action — are POSIX paths regardless of the OS the lattice
-        happens to run on. `PureWindowsPath("/etc/passwd").is_absolute()` is ``False`` (there is no
-        drive letter), which would make `root / path` join it as if it were relative and silently
-        fold a real absolute path into a path underneath the workspace root — exactly the kind of
-        mistake that would make `_is_critical` and `_escapes_root` wrong on Windows.
+        happens to be on the machine running it. See :meth:`_is_posix_absolute` for why
+        absoluteness itself is not checked with `Path.is_absolute()` alone.
         """
-        text = str(path)
-        is_absolute = text.startswith(("/", "\\")) or path.is_absolute()
-        candidate = path if is_absolute else root / path
+        candidate = path if ShadowFilesystem._is_posix_absolute(path) else root / path
         return Path(os.path.normpath(str(candidate)))
 
     @staticmethod

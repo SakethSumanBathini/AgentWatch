@@ -120,6 +120,30 @@ def test_a_posix_absolute_target_is_not_folded_under_the_root():
     assert result.escapes_root is True
 
 
+def test_a_relative_root_is_rejected_rather_than_silently_corrupted():
+    """Regression test found by CodeRabbit review, verified before fixing.
+
+    The constructor used to call `self._normalise(Path(root), root=Path(root))`, passing the
+    (possibly relative) root as both the path and the root argument. For a relative root,
+    `_normalise` took the else branch and computed `root / path`, which with the same value on
+    both sides doubles it: `ShadowFilesystem(Path("workspace")).root` used to come out as
+    `Path("workspace/workspace")` — still relative, not the absolute path the docstring promises.
+    Every downstream decision (`_is_critical`, `_escapes_root`, `simulate`) derives from `self.root`,
+    so this silently corrupted the safety-relevant state without raising or looking obviously
+    wrong locally. Confirmed against the actual pushed code before this fix: it produced exactly
+    that doubled path. The constructor now validates and raises rather than continuing silently.
+    """
+    with pytest.raises(ValueError, match="absolute"):
+        ShadowFilesystem(Path("workspace"))
+
+
+def test_a_root_with_dot_segments_is_still_collapsed():
+    # The root itself goes through the same normalisation as any other path, so this is
+    # unaffected by the fix above: an absolute root with `.`/`..` segments still collapses.
+    fs = ShadowFilesystem(Path("/srv/app/../app"))
+    assert fs.root == Path("/srv/app")
+
+
 # --------------------------------------------------------------------- critical paths
 
 
