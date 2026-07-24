@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import builtins
+import os
+from pathlib import Path
+
+import pytest
+
+from agentwatch.lattice.shadow_filesystem import (
+    FileAction,
+    FileOperation,
+    MutationType,
+    ShadowFilesystem,
+)
+
+ROOT = Path("/srv/workspace")
+
+
+def _fs(*known: str) -> ShadowFilesystem:
+    return ShadowFilesystem(ROOT, known_paths=[Path(p) for p in known])
+
+
+def _write(path: str) -> FileAction:
+    return FileAction(operation=FileOperation.WRITE, path=Path(path))
+
+
+def _delete(path: str) -> FileAction:
+    return FileAction(operation=FileOperation.DELETE, path=Path(path))
+
+
+# --------------------------------------------------------------------- mutation type
+
+
+def test_write_to_unknown_path_is_a_create():
+    result = _fs().simulate(_write("notes.md"))
+    assert result.mutation is MutationType.CREATE
+    assert result.existed_before is False
+
+
+def test_write_to_known_path_is_a_modify():
+    result = _fs("/srv/workspace/notes.md").simulate(_write("notes.md"))
+    assert result.mutation is MutationType.MODIFY
+    assert result.existed_before is True
+
+
+def test_append_follows_the_same_rule_as_write():
+    fs = _fs("/srv/workspace/log.txt")
+    append = FileAction(operation=FileOperation.APPEND, path=Path("log.txt"))
+    assert fs.simulate(append).mutation is MutationType.MODIFY
+
+    fresh = FileAction(operation=FileOperation.APPEND, path=Path("new.txt"))
+    assert fs.simulate(fresh).mutation is MutationType.CREATE
+
+
+def test_mkdir_on_an_unknown_directory_is_a_create():
+    action = FileAction(operation=FileOperation.MKDIR, path=Path("build"))
+    assert _fs().simulate(action).mutation is MutationType.CREATE
+
+
+def test_delete_of_a_known_path_is_a_delete():
+    result = _fs("/srv/workspace/stale.log").simulate(_delete("stale.log"))
+    assert result.mutation is MutationType.DELETE
+    assert result.existed_before is True
+
+
+def test_delete_of_an_unknown_path_reports_that_nothing_was_there():
+    # Still a DELETE — that is what was asked for — but `existed_before` marks it a no-op.
+    result = _fs().simulate(_delete("ghost.log"))
+    assert result.mutation is MutationType.DELETE
+    assert result.existed_before is False
+
+
+# --------------------------------------------------------------------- path handling
+
+
+def test_relative_paths_resolve_against_the_root():
+    result = _fs().simulate(_write("src/app.py"))
+    assert result.target_path == Path("/srv/workspace/src/app.py")
+
+
+def test_absolute_paths_are_kept_as_given():
+    result = _fs().simulate(_write("/data/scratch.txt"))
+    assert result.target_path == Path("/data/scratch.txt")
+
+
+def test_parent_traversal_is_collapsed():
+    result = _fs().simulate(_write("src/../config.yml"))
+    assert result.target_path == Path("/srv/workspace/config.yml")
+
+
+def test_traversal_that_climbs_out_of_the_root_is_reported():
+    result = _fs().simulate(_write("../../etc/passwd"))
+    assert result.target_path == Path("/etc/passwd")
+    assert result.escapes_root is True
+    assert result.is_critical_path is True
+
+
+def test_a_path_inside_the_root_does_not_escape():
+    assert _fs().simulate(_write("src/app.py")).escapes_root is False
+
+
+def test_a_sibling_of_the_root_escapes_it():
+    # /srv/other shares a parent with the root but is not inside it.
+    assert _fs().simulate(_write("/srv/other/file.txt")).escapes_root is True
+
+
+# --------------------------------------------------------------------- critical paths
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/etc", "/var", "/boot", "/root", "/home", "/usr", "/bin", "/sbin"],
+)
+def test_each_critical_directory_is_flagged(path):
+    assert _fs().simulate(_delete(path)).is_critical_path is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/etc/passwd", "/usr/local/bin/tool", "/home/alice/.ssh/id_rsa", "/var/log/syslog"],
+)
+def test_descendants_of_critical_directories_are_flagged(path):
+    assert _fs().simulate(_write(path)).is_critical_path is True
+
+
+@pytest.mark.parametrize("path", ["/srv/workspace/app.py", "/data/scratch", "/opt/tool/bin"])
+def test_ordinary_paths_are_not_flagged(path):
+    assert _fs().simulate(_write(path)).is_critical_path is False
+
+
+def test_a_path_merely_prefixed_like_a_critical_one_is_not_flagged():
+    # "/etcetera" starts with the characters of "/etc" but is a different directory.
+    assert _fs().simulate(_write("/etcetera/notes.md")).is_critical_path is False
+
+
+# --------------------------------------------------------------------- sequences
+
+
+def test_apply_makes_a_later_write_read_as_an_overwrite():
+    fs = _fs()
+    first = fs.apply(_write("report.md"))
+    second = fs.simulate(_write("report.md"))
+
+    assert first.mutation is MutationType.CREATE
+    assert second.mutation is MutationType.MODIFY
+
+
+def test_apply_of_a_delete_removes_the_path_from_the_model():
+    fs = _fs("/srv/workspace/temp.bin")
+    fs.apply(_delete("temp.bin"))
+
+    assert fs.exists(Path("temp.bin")) is False
+    assert fs.simulate(_write("temp.bin")).mutation is MutationType.CREATE
+
+
+def test_simulate_leaves_the_model_untouched():
+    fs = _fs()
+    before = set(fs.known_paths)
+    fs.simulate(_write("a.txt"))
+    fs.simulate(_delete("a.txt"))
+    assert fs.known_paths == before
+
+
+# --------------------------------------------------------------------- the I/O ban
+
+
+def test_simulation_works_for_a_root_that_does_not_exist_on_disk():
+    # Nothing under this root is real, so any implementation that consulted the disk would either
+    # fail or give the wrong answer here.
+    fs = ShadowFilesystem(
+        Path("/nonexistent/definitely/not/here"),
+        known_paths=[Path("/nonexistent/definitely/not/here/a.txt")],
+    )
+    assert fs.simulate(_write("a.txt")).mutation is MutationType.MODIFY
+    assert fs.simulate(_write("b.txt")).mutation is MutationType.CREATE
+
+
+def test_no_filesystem_call_is_made_during_simulation(monkeypatch):
+    """The crucial constraint: simulation must never touch the disk.
+
+    Every filesystem entry point the class could plausibly reach is wrapped in a recorder. The
+    wrappers still call through, so pytest's own machinery keeps working; the assertion is simply
+    that none of them fired while the simulator was running.
+    """
+    calls: list[str] = []
+
+    def _record(name, original):
+        def wrapper(*args, **kwargs):
+            calls.append(name)
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    for attr in ("resolve", "exists", "stat", "is_file", "is_dir", "iterdir", "glob", "open"):
+        monkeypatch.setattr(Path, attr, _record(f"Path.{attr}", getattr(Path, attr)))
+    for name in ("stat", "lstat", "listdir", "scandir", "walk"):
+        monkeypatch.setattr(os, name, _record(f"os.{name}", getattr(os, name)))
+    monkeypatch.setattr(builtins, "open", _record("open", builtins.open))
+
+    fs = ShadowFilesystem(ROOT, known_paths=[Path("/srv/workspace/existing.txt")])
+
+    # Anything the recorders caught before this point belongs to test setup, not the simulator.
+    calls.clear()
+
+    for action in (
+        _write("existing.txt"),
+        _write("new.txt"),
+        _delete("existing.txt"),
+        _write("../../etc/passwd"),
+        FileAction(operation=FileOperation.MKDIR, path=Path("build/out")),
+    ):
+        result = fs.simulate(action)
+        assert result.target_path.is_absolute()
+
+    fs.apply(_write("another.txt"))
+    fs.exists(Path("another.txt"))
+
+    assert calls == [], f"ShadowFilesystem performed real filesystem I/O: {sorted(set(calls))}"
